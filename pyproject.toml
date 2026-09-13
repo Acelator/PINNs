@@ -1,0 +1,15 @@
+[project]
+name = "Learning_PINNs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.0",
+    "notebook>=7.6.2",
+    "numpy>=2.5.1",
+    "pandas>=3.0.5",
+    "pyqt6>=6.11.0",
+    "scipy>=1.18.0",
+    "torch>=2.13.0",
+]
