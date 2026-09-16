@@ -1,0 +1,4 @@
+This repository contains different implementations of techniques related to PINNs, in order to study their architectures, strengths and drawbacks compared to traditional numerical methods (such as finite differences or FEM) for PDEs. In the future, I would like to add benchmarks showcasing the slower convergence of PINNs, while also exploring their advantages and why they are attracting increasing interest in the numerical mathematics landscape. Once I obtain a solid grasp of their underlying mathematical concepts, I will explore generalizations that have emerged in recent years, such as XPINNs and cPINNs.
+
+Use of AI for coding in this repo is kept to a minimum, since the objective is my own learning. I will only use it primarily to point out bugs, help me when I'm stuck, and explain code.
+
