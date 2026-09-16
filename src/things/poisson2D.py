@@ -9,7 +9,7 @@ import torch
 from scipy.stats import qmc
 from torch import nn
 
-printData = True
+printData = False
 
 matplotlib.use("qtagg")
 
@@ -132,7 +132,7 @@ if printData:
 # Build neural network
 torch.set_default_dtype(torch.float64)
 model = PoissonPINN(2, 1, 32, 3, nn.Tanh).to(device)
-print(model)
+# print(model)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"Trainable parameters: {n_params}")
 
@@ -155,6 +155,7 @@ def pde_residual(Z):
         :, 1:2
     ]
 
+    # [:, 0:1] maintaing the dimensionality of the data when extracting
     return (
         u_xx
         + u_yy
@@ -168,16 +169,15 @@ lambda_physics = 1.0
 lambda_boundary = 20.0
 
 mse_criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer_Adam = torch.optim.Adam(model.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer_Adam, mode="min", factor=0.5, patience=500
+)
 
 loss_values = []
 
-model.train()
-start = time.time()
 
-for epoch in range(1, epochs + 1):
-    optimizer.zero_grad(set_to_none=True)
-
+def compute_loss():
     # Compute residual
     residual = pde_residual(collocation_values)
     loss_physics = mse_criterion(residual, torch.zeros_like(residual))
@@ -187,18 +187,66 @@ for epoch in range(1, epochs + 1):
 
     total_loss = (lambda_physics * loss_physics) + (lambda_boundary * loss_bc)
 
-    total_loss.backward()
-    optimizer.step()
+    return total_loss, loss_physics, loss_bc
+
+
+model.train()
+start = time.time()
+
+# for epoch in range(1, epochs + 1):
+# print("----- Fase adams -----")
+for epoch in range(1, 3001):
+    optimizer_Adam.zero_grad(set_to_none=True)
+
+    loss, loss_physics, loss_bc = compute_loss()
+
+    loss.backward()
+    optimizer_Adam.step()
+    scheduler.step(loss.detach())
 
     if epoch % 20 == 0:
-        loss_values.append(total_loss.item())
+        loss_values.append(loss.item())
 
     if epoch % 3000 == 0 or epoch == 1:
+        current_lr = optimizer_Adam.param_groups[0]["lr"]
         print(
-            f"Epoch {epoch:5d}/{epochs} | Total Loss: {total_loss.item():.6e} | "
+            f"Epoch {epoch:5d}/{epochs} | Total Loss: {loss.item():.6e} | "
+            f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e} | lr: {current_lr:.6e}"
+        )
+
+# print("----- Fase LBFGS -----")
+# lr=1.0 is normal when using strong_wolfe
+optimizer_lbfgs = torch.optim.LBFGS(
+    model.parameters(),
+    lr=1.0,
+    max_iter=50000,
+    max_eval=50000,
+    history_size=50,
+    tolerance_grad=1e-7,
+    tolerance_change=1e-9,
+    line_search_fn="strong_wolfe",
+)
+
+step_counter = 0
+
+
+def closure():
+    global step_counter
+    optimizer_lbfgs.zero_grad()
+    loss, loss_physics, loss_bc = compute_loss()
+    loss.backward()
+
+    step_counter += 1
+    if step_counter % 200 == 0:
+        print(
+            f"L-BFGS Eval {step_counter} | Total Loss: {loss.item():.6e} | "
             f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e}"
         )
 
+    return loss
+
+
+optimizer_lbfgs.step(closure)
 
 end = time.time()
 computation_time = {}
@@ -214,3 +262,19 @@ if printData:
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
+
+
+# Measure error against the real solution (L_2 - norm)
+
+# Puntos de prueba densos fuera del bucle de entrenamiento
+x_test = torch.linspace(0, 1, 100, device=device, dtype=torch.float64)
+y_test = torch.linspace(0, 1, 100, device=device, dtype=torch.float64)
+grid_x, grid_y = torch.meshgrid(x_test, y_test, indexing="ij")
+pts = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
+
+with torch.no_grad():
+    u_pred = model(pts)
+    u_true = torch.exp(pts[:, 0] * pts[:, 1]).unsqueeze(1)
+
+    rel_l2_error = torch.norm(u_pred - u_true, p=2) / torch.norm(u_true, p=2)
+    print(f"Relative L2 Error: {rel_l2_error.item():.6e}")
