@@ -1,5 +1,7 @@
-# PINN for solving the Poisson equation in 2D: \Delta(u(x,y)) = e^{x*y} * (x^2 + y^2) with Dirichlet boundary conditions. The domain is \omega = [0,1] x [0,1].
+# PINN for solving the Poisson equation in 2D: \Delta(u(x,y)) = e^{x*y} * (x^2 + y^2) with Dirichlet boundary conditions (g as defined below on the boundary). The domain is \omega = [0,1] x [0,1].
 
+import math
+import sys
 import time
 
 import matplotlib
@@ -11,11 +13,18 @@ from torch import nn
 
 printData = False
 
+# Allowed values are hard and soft. They represent how we should approach the boundary conditions. When hard is set, we impose explicitly the boundary condition.
+boundary_type_condition = "hard"
+
+if boundary_type_condition != "hard" and boundary_type_condition != "soft":
+    print("Type of boundary constraint not recognised")
+    sys.exit("Review boundary_type_condition value")
 matplotlib.use("qtagg")
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(42)
+torch.set_default_dtype(torch.float64)
 
 
 # Feed-Forward Architecture
@@ -39,7 +48,7 @@ class PoissonPINN(nn.Module):
 
         self._init_weights()
 
-    # Helps getting stable gradients with Tanh
+    # Helps obtain stable gradients with Tanh
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -47,7 +56,21 @@ class PoissonPINN(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.net(t)
+        if boundary_type_condition == "soft":
+            return self.net(t)
+
+        # Hard boundary constraint
+        x = t[:, 0:1]
+        y = t[:, 1:2]
+
+        nn_out = self.net(t)
+
+        D = x * (1.0 - x) * y * (1.0 - y)
+
+        # Ansatz
+        # G defines the boundary condition
+        u = G(x, y) + D * nn_out
+        return u
 
 
 # Problem definition
@@ -58,52 +81,64 @@ c = 0.0
 d = 1.0
 
 
-# Boundary condition is e^(x*y)
+# Boundary condition is e^(x*y), but it is also the exact solution. So it shouldn't be used anywhere but on the boundary.
 def g(x, y):
     # return np.zeros_like((x, y))
     return torch.exp(x * y)
 
 
-def fx(x, y):
+def G(x, y):
+    return 1 - x - y + y * torch.exp(x) + x * torch.exp(y) - x * y * (math.e - 1)
+
+
+def gx(x, y):
     # return np.zeros_like((x, y))
     return torch.exp(x * y) * y
 
 
-def fy(x, y):
+def gy(x, y):
     # return np.zeros_like((x, y))
     return torch.exp(x * y) * x
 
 
 # Data generation
-n_bc = 4
-n_data_per_bc = 30
 
-engine = qmc.LatinHypercube(d=1)  # Stratisfied statistical distribution
-# Axis 2 represents (x,y, u, ux, uy)
-data = np.zeros([n_bc, n_data_per_bc, 3])
+# If hard, we don't need boundary points to approximate the solution
+if boundary_type_condition == "soft":
+    n_bc = 4
+    n_data_per_bc = 30
 
-for i, j in zip(range(n_bc), [a, b, c, d]):
-    points = engine.random(n=n_data_per_bc)[:, 0]
+    engine = qmc.LatinHypercube(d=1)  # Stratified statistical distribution
+    # Axis 2 represents (x,y, u)
+    data = np.zeros([n_bc, n_data_per_bc, 3])
 
-    if i < 2:
-        data[i, :, 0] = j
-        data[i, :, 1] = points
-    else:
-        data[i, :, 0] = points
-        data[i, :, 1] = j
+    for i, j in zip(range(n_bc), [a, b, c, d]):
+        points = engine.random(n=n_data_per_bc)[:, 0]
 
-with torch.no_grad():
-    z = torch.as_tensor(data[:, :, :2].reshape(-1, 2), dtype=torch.float64)
-    t = g(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
-    data[:, :, 2] = t
+        if i < 2:
+            data[i, :, 0] = j
+            data[i, :, 1] = points
+        else:
+            data[i, :, 0] = points
+            data[i, :, 1] = j
 
-    # For neumann condition
-    # tx = fx(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
-    # ty = fy(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
-    # data[:, :, 3] = tx
-    # data[:, :, 4] = ty
+    with torch.no_grad():
+        z = torch.as_tensor(data[:, :, :2].reshape(-1, 2), dtype=torch.float64)
+        t = g(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
+        data[:, :, 2] = t
 
-data_flat = data.reshape(n_data_per_bc * n_bc, 3)
+        # For Neumann conditions
+        # tx = fx(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
+        # ty = fy(z[:, 0:1], z[:, 1:2]).cpu().numpy().reshape(n_bc, n_data_per_bc)
+        # data[:, :, 3] = tx
+        # data[:, :, 4] = ty
+
+    data_flat = data.reshape(n_data_per_bc * n_bc, 3)
+
+    bc_values = torch.as_tensor(data_flat[:, :2], dtype=torch.float64, device=device)
+    bc_sol_values = torch.as_tensor(
+        data_flat[:, 2:3], dtype=torch.float64, device=device
+    )
 
 
 # Collocation points
@@ -113,14 +148,19 @@ colloc = engine.random(Nc)
 colloc = 1 * (colloc - 0)
 
 # torch tensors on the selected device; collocation points require grad for AD
-bc_values = torch.as_tensor(data_flat[:, :2], dtype=torch.float64, device=device)
-bc_sol_values = torch.as_tensor(data_flat[:, 2:3], dtype=torch.float64, device=device)
+
 collocation_values = torch.as_tensor(colloc, dtype=torch.float64, device=device)
 
 if printData:
     plt.figure("", figsize=(7, 7))
-    plt.title("Boundary Data points and Collocation points", fontsize=16)
-    plt.scatter(data_flat[:, 0], data_flat[:, 1], marker="x", c="k", label="BDP")
+
+    if boundary_type_condition == "soft":
+        plt.title("Boundary Data points and Collocation points", fontsize=16)
+        plt.scatter(data_flat[:, 0], data_flat[:, 1], marker="x", c="k", label="BDP")
+    else:
+        plt.title("Collocation points", fontsize=16)
+        plt.plot([0, 1, 1, 0, 0], [0, 0, 1, 1, 0], color="black", linewidth=1.5)
+
     plt.scatter(colloc[:, 0], colloc[:, 1], s=2, marker=".", c="r", label="CP")
     plt.xlabel("x", fontsize=16)
     plt.ylabel("y", fontsize=16)
@@ -130,7 +170,6 @@ if printData:
 
 
 # Build neural network
-torch.set_default_dtype(torch.float64)
 model = PoissonPINN(2, 1, 32, 3, nn.Tanh).to(device)
 # print(model)
 n_params = sum(p.numel() for p in model.parameters())
@@ -164,7 +203,7 @@ def pde_residual(Z):
 
 
 # Training loop
-epochs = 15000
+epochs = 3000
 lambda_physics = 1.0
 lambda_boundary = 20.0
 
@@ -182,12 +221,15 @@ def compute_loss():
     residual = pde_residual(collocation_values)
     loss_physics = mse_criterion(residual, torch.zeros_like(residual))
 
-    # Boundary condition evaluation
-    loss_bc = mse_criterion(model(bc_values), bc_sol_values)
+    if boundary_type_condition == "soft":
+        # Boundary condition evaluation
+        loss_bc = mse_criterion(model(bc_values), bc_sol_values)
 
-    total_loss = (lambda_physics * loss_physics) + (lambda_boundary * loss_bc)
+        total_loss = (lambda_physics * loss_physics) + (lambda_boundary * loss_bc)
 
-    return total_loss, loss_physics, loss_bc
+        return total_loss, loss_physics, loss_bc
+    else:
+        return loss_physics
 
 
 model.train()
@@ -195,10 +237,13 @@ start = time.time()
 
 # for epoch in range(1, epochs + 1):
 # print("----- Fase adams -----")
-for epoch in range(1, 3001):
+for epoch in range(1, epochs):
     optimizer_Adam.zero_grad(set_to_none=True)
 
-    loss, loss_physics, loss_bc = compute_loss()
+    if boundary_type_condition == "soft":
+        loss, loss_physics, loss_bc = compute_loss()
+    else:
+        loss = compute_loss()
 
     loss.backward()
     optimizer_Adam.step()
@@ -209,10 +254,16 @@ for epoch in range(1, 3001):
 
     if epoch % 3000 == 0 or epoch == 1:
         current_lr = optimizer_Adam.param_groups[0]["lr"]
-        print(
-            f"Epoch {epoch:5d}/{epochs} | Total Loss: {loss.item():.6e} | "
-            f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e} | lr: {current_lr:.6e}"
-        )
+
+        if boundary_type_condition == "soft":
+            print(
+                f"Epoch {epoch:5d}/{epochs} | Total Loss: {loss.item():.6e} | "
+                f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e} | lr: {current_lr:.6e}"
+            )
+        else:
+            print(
+                f"Epoch {epoch:5d}/{epochs} | Total Loss: {loss.item():.6e} | lr: {current_lr:.6e}"
+            )
 
 # print("----- Fase LBFGS -----")
 # lr=1.0 is normal when using strong_wolfe
@@ -233,15 +284,23 @@ step_counter = 0
 def closure():
     global step_counter
     optimizer_lbfgs.zero_grad()
-    loss, loss_physics, loss_bc = compute_loss()
+
+    if boundary_type_condition == "soft":
+        loss, loss_physics, loss_bc = compute_loss()
+    else:
+        loss = compute_loss()
+
     loss.backward()
 
     step_counter += 1
     if step_counter % 200 == 0:
-        print(
-            f"L-BFGS Eval {step_counter} | Total Loss: {loss.item():.6e} | "
-            f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e}"
-        )
+        if boundary_type_condition == "soft":
+            print(
+                f"L-BFGS Eval {step_counter} | Total Loss: {loss.item():.6e} | "
+                f"Physics Loss: {loss_physics.item():.6e} | BC Loss: {loss_bc.item():.6e}"
+            )
+        else:
+            print(f"L-BFGS Eval {step_counter} | Total Loss: {loss.item():.6e}")
 
     return loss
 
@@ -266,12 +325,13 @@ if printData:
 
 # Measure error against the real solution (L_2 - norm)
 
-# Puntos de prueba densos fuera del bucle de entrenamiento
+# Dense test points outside the training loop
 x_test = torch.linspace(0, 1, 100, device=device, dtype=torch.float64)
 y_test = torch.linspace(0, 1, 100, device=device, dtype=torch.float64)
 grid_x, grid_y = torch.meshgrid(x_test, y_test, indexing="ij")
 pts = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
 
+model.eval()
 with torch.no_grad():
     u_pred = model(pts)
     u_true = torch.exp(pts[:, 0] * pts[:, 1]).unsqueeze(1)
